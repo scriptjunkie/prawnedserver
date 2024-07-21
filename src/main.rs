@@ -32,34 +32,35 @@ static CODE_CLIENT_BROADCASTED: &[u8; 1] = b"\x09";
 static CODE_CLIENT_ANNOUNCE: &[u8; 1] = b"\x0c";
 static CODE_CLIENT_FWD_NOW: &[u8; 1] = b"\x0d";
 
-//reads bytes if not read yet
-fn check_len(len: &mut usize, s: &mut TcpStream, buf: &mut [u8], min: usize) -> Result<()> {
-    if min > buf.len() {
-        return Err(Error::from(ErrorKind::InvalidInput)); //can't fit into buf - your fault fail
-    } else if *len < min {
-        s.read_exact(&mut buf[*len..min])?;
-        *len = min;
+//reads bytes if not read yet to ensure there's at least len bytes in the vec
+fn check_len(s: &mut TcpStream, buf: &mut smallvec::SmallVec::<[u8; 2048]>, min: usize) -> Result<()> {
+    let len = buf.len();
+    if min > len { // if necessary get more bytes
+        buf.resize(min, 0); //grow buffer (may not actually allocate)
+        s.read_exact(&mut buf[len..min])?; //read more bytes
     }
     Ok(())
 }
 
-//receives a websocket message. Must fit inside buf, with headers
-fn ws_recv<'a>(stream: &mut TcpStream, buf: &'a mut [u8], readb: &mut usize, offsb: &mut usize) -> Result<&'a mut [u8]> {
-    for i in 0..(*readb - *offsb) { //if there are leftover bytes from a previous message,
+//receives a websocket message. Must fit inside buf, with headers.
+fn ws_recv<'a>(stream: &mut TcpStream, buf: &'a mut smallvec::SmallVec::<[u8; 2048]>, offsb: &mut usize) -> Result<&'a mut [u8]> {
+    for i in 0..(buf.len() - *offsb) { //if there are leftover bytes from a previous message,
         buf[i] = buf[i + *offsb]; //memmove them down to the beginning of the buffer and continue
     }
-    *readb -= *offsb;
+    buf.truncate(buf.len() - *offsb); //then resize down
     *offsb = 0;
-    if *readb == 0 {
-        *readb = stream.read(&mut buf[*readb..])?; //read in whatever's available
+    if buf.len() == 0 {
+        buf.resize(buf.capacity(), 0);
+        let readb = stream.read(&mut buf[..])?;
+        buf.truncate(readb); //read in whatever's available and truncate to there
     };
-    check_len(readb, stream, buf, 2)?; //but make sure it's at least 2 bytes, then parse length
+    check_len(stream, buf, 2)?; //but make sure it's at least 2 bytes, then parse length
     let (leng, offs) = if buf[1] & 0x7F == 127 {
-        check_len(readb, stream, buf, 10)?; //make sure we can fit all this
+        check_len(stream, buf, 10)?; //make sure we can fit all this
         let lenbytes = [buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]];
         (u64::from_be_bytes(lenbytes) as usize, 10) // More than 64k?
     } else if buf[1] & 0x7F == 126 {
-        check_len(readb, stream, buf, 4)?;
+        check_len(stream, buf, 4)?;
         (buf[2] as usize * 256 + buf[3] as usize, 4)
     } else {
         ((buf[1] & 0x7F) as usize, 2)
@@ -68,11 +69,11 @@ fn ws_recv<'a>(stream: &mut TcpStream, buf: &'a mut [u8], readb: &mut usize, off
     let mut mask = [0; 4];
     let masked = buf[1] & 0x80 != 0;
     if masked {
-        check_len(readb, stream, buf, *offsb + 4)?; //make sure we can fit
+        check_len(stream, buf, *offsb + 4)?; //make sure we can fit
         (&mut mask[..]).copy_from_slice(&buf[*offsb..*offsb + 4]);
         *offsb += 4;
     }
-    check_len(readb, stream, buf, *offsb + leng)?; //read the rest of the data if needed
+    check_len(stream, buf, *offsb + leng)?; //read the rest of the data if needed
     if masked {
         for i in 0..leng {
             buf[*offsb + i] ^= mask[i % 4]; //demask
@@ -83,9 +84,9 @@ fn ws_recv<'a>(stream: &mut TcpStream, buf: &'a mut [u8], readb: &mut usize, off
     *offsb += leng; // now we've handled this much
     if code == WS_PING { //ping
         ws_send(stream, &buf[startoffs..startoffs + leng], WS_PONG)?; //answer the ping
-        return ws_recv(stream, buf, readb, offsb) //recurse and try again
+        return ws_recv(stream, buf, offsb) //recurse and try again
     } else if code == WS_PONG {
-        return ws_recv(stream, buf, readb, offsb) //recurse and try again
+        return ws_recv(stream, buf, offsb) //recurse and try again
     } else if code == WS_EOF {
         return Err(Error::from(ErrorKind::UnexpectedEof))
     }
@@ -139,11 +140,14 @@ Content-Length: {}\r\n\r\n", body.len())?; //normal headers
 
 //initializes a websocket connection
 fn setup_websocket_server_connection(stream: &mut TcpStream) -> Result<bool> {
-    let mut buf = [0; 2048]; //we don't do cookies or anything, should be PLENTY - no need to alloc
-    let bytes = stream.read(&mut buf)?; //the full GET is usually ~256 bytes
-    //if the http is >2k or not in one read/tcp segment, it isn't a browser; they're messing with us
-    let data = &buf[..bytes]; // so find \r\n\r\n or return error
-    data.windows(4).position(|w| w == b"\r\n\r\n").ok_or(Error::from(ErrorKind::NotFound))?;
+    let mut buf = [0; 2048]; //we don't do cookies or anything, should be plenty, but maybe not
+    let rlen = stream.read(&mut buf)?;
+    let mut data = smallvec::SmallVec::from_buf_and_len(buf, rlen); //read
+    while data.windows(4).position(|w| w == b"\r\n\r\n").is_none() {
+        let mut anotherbuf = [0; 2048];
+        let morebytes = stream.read(&mut anotherbuf)?; // find \r\n\r\n or keep receiving
+        data.extend_from_slice(&anotherbuf[..morebytes]);
+    }
     let needle = b"Sec-WebSocket-Key: "; //find the header or return root
     let idx = if let Some(i) = data.windows(needle.len()).position(|w| w == needle) { i } else {
         handle_root(stream)?;
@@ -173,7 +177,9 @@ fn do_one(conns: &mut BTreeMap<u32, TcpStream>, buf: &mut [u8]) -> Result<()> {
         let dest = u32::from_le_bytes([buf[1],buf[2],buf[3],buf[4]]);
         if let Some(other_stream) = conns.get_mut(&dest){
             println!("forwarding {} bytes to {}", buf.len() - 5, dest);  //legit client
-            ws_send(other_stream, &buf[5..], WS_BINARY)?;
+            if let Err(e) = ws_send(other_stream, &buf[5..], WS_BINARY) {
+                println!("Error forwarding to {}: {}", dest, e);
+            }
         }else{
             println!("Couldn't find {} maybe they left", dest);
         }
@@ -199,10 +205,10 @@ fn do_it(mut stream: TcpStream, state: Arc<Mutex<State>>, address: SocketAddr) -
     if ! setup_websocket_server_connection(&mut stream)? {
         return Ok(()); //not a websocket
     }
-    let mut buf = [0; 2048];
+    let mut recvvec = smallvec::SmallVec::new();
     let mut zoneid: u128 = 0;
-    let (mut readb, mut offsb) = (0, 0);
-    if let Ok(r) = ws_recv(&mut stream, &mut buf[..], &mut readb, &mut offsb) {
+    let mut offsb = 0;
+    if let Ok(r) = ws_recv(&mut stream, &mut recvvec, &mut offsb) {
         if r.len() == 16 {
             zoneid = u128::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],
                 r[11],r[12],r[13],r[14],r[15]]); //get zone
@@ -236,10 +242,9 @@ fn do_it(mut stream: TcpStream, state: Arc<Mutex<State>>, address: SocketAddr) -
         if let Ok(_) = ws_send(&mut stream, &full_list, WS_BINARY){
             println!("Client {} is zone {:X} ID {}", address, zoneid, id);
             zone.insert(id, stream);
-            drop(zone);
             drop(stat); //release lock
             drop(full_list); //allow re-use of stack space
-            while let Ok(rcvd) = ws_recv(&mut rcv_stream, &mut buf[..], &mut readb, &mut offsb) {
+            while let Ok(rcvd) = ws_recv(&mut rcv_stream, &mut recvvec, &mut offsb) {
                 println!("Received {} from {}", rcvd.len(), id);
                 if let Ok(mut s) = state.lock() {
                     if let Some(conns) = s.get_mut(&zoneid) { if let Err(e) = do_one(conns, rcvd){
