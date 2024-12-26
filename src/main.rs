@@ -146,6 +146,9 @@ fn setup_websocket_server_connection(stream: &mut TcpStream) -> Result<bool> {
     while data.windows(4).position(|w| w == b"\r\n\r\n").is_none() {
         let mut anotherbuf = [0; 2048];
         let morebytes = stream.read(&mut anotherbuf)?; // find \r\n\r\n or keep receiving
+        if morebytes == 0 {
+            return Ok(false);
+        }
         data.extend_from_slice(&anotherbuf[..morebytes]);
     }
     let needle = b"Sec-WebSocket-Key: "; //find the header or return root
